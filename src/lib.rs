@@ -34,11 +34,7 @@ use core::result::Result;
 
 use bitflags::bitflags;
 use byteorder::{BigEndian, ByteOrder};
-use embedded_hal::{
-    blocking::spi::{Transfer, Write},
-    digital::v2::OutputPin,
-    spi::{Mode, MODE_1},
-};
+use embedded_hal::spi::{Mode, Operation, SpiDevice, MODE_1};
 
 bitflags! {
     /// Configuration register contents.
@@ -105,15 +101,18 @@ enum Command {
 
 /// Error type for INA229 commands.
 #[derive(Debug)]
-pub enum Error<SPIError, CSError> {
+pub enum Error<SPIError: embedded_hal::spi::Error> {
     /// The INA229 is not configured.
     NotConfigured,
 
     /// An error occured during an SPI transaction.
     SPIError(SPIError),
+}
 
-    /// An error occured toggling the chip select.
-    ChipSelectError(CSError),
+impl<E: embedded_hal::spi::Error> From<E> for Error<E> {
+    fn from(value: E) -> Self {
+        Self::SPIError(value)
+    }
 }
 
 // Conversion constants
@@ -149,39 +148,37 @@ fn calculate_current_lsb(current_expected_max: f64) -> f64 {
 }
 
 /// INA229 voltage/current/power monitor
-pub struct INA229<SPI, NCS> {
+pub struct INA229<SPI: SpiDevice> {
     spi: SPI,
-    ncs: NCS,
     config: Option<Configuration>,
     current_lsb: Option<f64>,
 }
 
-impl<SPI, NCS, SPIError, CSError> INA229<SPI, NCS>
+impl<SPI> INA229<SPI>
 where
-    SPI: Transfer<u8, Error = SPIError> + Write<u8, Error = SPIError>,
-    NCS: OutputPin<Error = CSError>,
+    SPI: SpiDevice,
 {
     /// Create a new instance of an INA229 device.
-    pub fn new(spi: SPI, ncs: NCS) -> Self {
+    pub fn new(spi: SPI) -> Self {
         INA229 {
             spi,
-            ncs,
             config: None,
             current_lsb: None,
         }
     }
 
     /// Destroy the INA229 instance and return the SPI.
-    pub fn release(self) -> (SPI, NCS) {
-        (self.spi, self.ncs)
+    pub fn release(self) -> SPI {
+        self.spi
     }
 
-    fn read_register_u16(&mut self, register: Register) -> Result<u16, Error<SPIError, CSError>> {
-        let mut buffer = [get_frame(register, Command::Read), 0x00, 0x00];
-        self.ncs.set_low().map_err(Error::ChipSelectError)?;
-        self.spi.transfer(&mut buffer).map_err(Error::SPIError)?;
-        self.ncs.set_high().map_err(Error::ChipSelectError)?;
-        let value = BigEndian::read_u16(&buffer[1..3]);
+    fn read_register_u16(&mut self, register: Register) -> Result<u16, Error<SPI::Error>> {
+        let mut buffer = [0x00, 0x00];
+        self.spi.transaction(&mut [
+            Operation::Write(&[get_frame(register, Command::Read)]),
+            Operation::Read(&mut buffer),
+        ])?;
+        let value = u16::from_be_bytes(buffer);
         Ok(value)
     }
 
@@ -189,39 +186,41 @@ where
         &mut self,
         register: Register,
         value: u16,
-    ) -> Result<(), Error<SPIError, CSError>> {
-        let mut buffer = [get_frame(register, Command::Write), 0x00, 0x00];
-        BigEndian::write_u16_into(&[value], &mut buffer[1..3]);
-        self.ncs.set_low().map_err(Error::ChipSelectError)?;
-        self.spi.write(&buffer).map_err(Error::SPIError)?;
-        self.ncs.set_high().map_err(Error::ChipSelectError)?;
+    ) -> Result<(), Error<SPI::Error>> {
+        self.spi.transaction(&mut [
+            Operation::Write(&[get_frame(register, Command::Write)]),
+            Operation::Write(&value.to_be_bytes()),
+        ])?;
         Ok(())
     }
 
-    fn read_register_i16(&mut self, register: Register) -> Result<i16, Error<SPIError, CSError>> {
-        let mut buffer = [get_frame(register, Command::Read), 0x00, 0x00];
-        self.ncs.set_low().map_err(Error::ChipSelectError)?;
-        self.spi.transfer(&mut buffer).map_err(Error::SPIError)?;
-        self.ncs.set_high().map_err(Error::ChipSelectError)?;
-        let value = BigEndian::read_i16(&buffer[1..3]);
+    fn read_register_i16(&mut self, register: Register) -> Result<i16, Error<SPI::Error>> {
+        let mut buffer = [0x00, 0x00];
+        self.spi.transaction(&mut [
+            Operation::Write(&[get_frame(register, Command::Read)]),
+            Operation::Read(&mut buffer),
+        ])?;
+        let value = i16::from_be_bytes(buffer);
         Ok(value)
     }
 
-    fn read_register_u24(&mut self, register: Register) -> Result<u32, Error<SPIError, CSError>> {
-        let mut buffer = [get_frame(register, Command::Read), 0x00, 0x00, 0x00];
-        self.ncs.set_low().map_err(Error::ChipSelectError)?;
-        self.spi.transfer(&mut buffer).map_err(Error::SPIError)?;
-        self.ncs.set_high().map_err(Error::ChipSelectError)?;
-        let value = BigEndian::read_u24(&buffer[1..4]);
+    fn read_register_u24(&mut self, register: Register) -> Result<u32, Error<SPI::Error>> {
+        let mut buffer = [0x00, 0x00, 0x00];
+        self.spi.transaction(&mut [
+            Operation::Write(&[get_frame(register, Command::Read)]),
+            Operation::Read(&mut buffer),
+        ])?;
+        let value = BigEndian::read_u24(&buffer);
         Ok(value)
     }
 
-    fn read_register_i24(&mut self, register: Register) -> Result<i32, Error<SPIError, CSError>> {
-        let mut buffer = [get_frame(register, Command::Read), 0x00, 0x00, 0x00];
-        self.ncs.set_low().map_err(Error::ChipSelectError)?;
-        self.spi.transfer(&mut buffer).map_err(Error::SPIError)?;
-        self.ncs.set_high().map_err(Error::ChipSelectError)?;
-        let value = BigEndian::read_i24(&buffer[1..4]);
+    fn read_register_i24(&mut self, register: Register) -> Result<i32, Error<SPI::Error>> {
+        let mut buffer = [0x00, 0x00, 0x00];
+        self.spi.transaction(&mut [
+            Operation::Write(&[get_frame(register, Command::Read)]),
+            Operation::Read(&mut buffer),
+        ])?;
+        let value = BigEndian::read_i24(&buffer);
         Ok(value)
     }
 
@@ -229,29 +228,28 @@ where
     pub fn set_configuration(
         &mut self,
         configuration: Configuration,
-    ) -> Result<(), Error<SPIError, CSError>> {
+    ) -> Result<(), Error<SPI::Error>> {
         self.write_register_u16(Register::Configuration, configuration.bits())?;
         self.config = Some(configuration);
         Ok(())
     }
 
     /// Get the configuration.
-    pub fn configuration(&mut self) -> Result<Configuration, Error<SPIError, CSError>> {
+    pub fn configuration(&mut self) -> Result<Configuration, Error<SPI::Error>> {
         self.read_register_u16(Register::Configuration)
             .map(Configuration::from_bits_truncate)
-            .map(|config| {
+            .inspect(|&config| {
                 self.config = Some(config);
-                config
             })
     }
 
     /// Gets the value from the shunt calibration register.
-    pub fn shunt_calibration(&mut self) -> Result<u16, Error<SPIError, CSError>> {
+    pub fn shunt_calibration(&mut self) -> Result<u16, Error<SPI::Error>> {
         self.read_register_u16(Register::ShuntCalibration)
     }
 
     /// Sets the shunt calibration register to the value provided.
-    pub fn set_shunt_calibration(&mut self, value: u16) -> Result<(), Error<SPIError, CSError>> {
+    pub fn set_shunt_calibration(&mut self, value: u16) -> Result<(), Error<SPI::Error>> {
         self.write_register_u16(Register::ShuntCalibration, value)
     }
 
@@ -260,7 +258,7 @@ where
         &mut self,
         shunt_resistance: f64,
         current_expected_max: f64,
-    ) -> Result<(), Error<SPIError, CSError>> {
+    ) -> Result<(), Error<SPI::Error>> {
         if let Some(config) = self.config {
             let (current_lsb, value) =
                 calculate_calibration_value(config, shunt_resistance, current_expected_max);
@@ -278,30 +276,30 @@ where
         configuration: Configuration,
         shunt_resistance: f64,
         current_expected_max: f64,
-    ) -> Result<(), Error<SPIError, CSError>> {
+    ) -> Result<(), Error<SPI::Error>> {
         self.set_configuration(configuration)
             .and_then(|_| self.calibrate(shunt_resistance, current_expected_max))
     }
 
     /// Get the raw bus voltage reading.
-    pub fn bus_voltage_raw(&mut self) -> Result<i32, Error<SPIError, CSError>> {
+    pub fn bus_voltage_raw(&mut self) -> Result<i32, Error<SPI::Error>> {
         self.read_register_i24(Register::BusVoltage).map(|x| x >> 4) // 20bit value.
     }
 
     /// Get the bus voltage reading in microvolts.
-    pub fn bus_voltage_microvolts(&mut self) -> Result<f64, Error<SPIError, CSError>> {
+    pub fn bus_voltage_microvolts(&mut self) -> Result<f64, Error<SPI::Error>> {
         self.bus_voltage_raw()
             .map(|x| (x as f64) * BUS_VOLTAGE_UV_PER_LSB)
     }
 
     /// Get the raw shunt voltage reading.
-    pub fn shunt_voltage_raw(&mut self) -> Result<i32, Error<SPIError, CSError>> {
+    pub fn shunt_voltage_raw(&mut self) -> Result<i32, Error<SPI::Error>> {
         self.read_register_i24(Register::ShuntVoltage)
             .map(|x| x >> 4)
     }
 
     /// Get the shunt voltage reading in nanovolts.
-    pub fn shunt_voltage_nanovolts(&mut self) -> Result<f64, Error<SPIError, CSError>> {
+    pub fn shunt_voltage_nanovolts(&mut self) -> Result<f64, Error<SPI::Error>> {
         if let Some(config) = self.config {
             self.shunt_voltage_raw().map(|value| {
                 if config.contains(Configuration::ADCRANGE) {
@@ -316,23 +314,23 @@ where
     }
 
     /// Get the raw die temperature value.
-    pub fn temperature_raw(&mut self) -> Result<i16, Error<SPIError, CSError>> {
+    pub fn temperature_raw(&mut self) -> Result<i16, Error<SPI::Error>> {
         self.read_register_i16(Register::DieTemperature)
     }
 
     /// Get the die temperature in millidegrees Celsius.
-    pub fn temperature_millidegrees_celsius(&mut self) -> Result<f64, Error<SPIError, CSError>> {
+    pub fn temperature_millidegrees_celsius(&mut self) -> Result<f64, Error<SPI::Error>> {
         self.temperature_raw()
             .map(|x| (x as f64) * TEMPERATURE_MC_PER_LSB)
     }
 
     /// Get the raw value from the current register.
-    pub fn current_raw(&mut self) -> Result<i32, Error<SPIError, CSError>> {
+    pub fn current_raw(&mut self) -> Result<i32, Error<SPI::Error>> {
         self.read_register_i24(Register::Current).map(|x| x >> 4) // 20bit value.
     }
 
     /// Get the current reading in Amps.
-    pub fn current_amps(&mut self) -> Result<f64, Error<SPIError, CSError>> {
+    pub fn current_amps(&mut self) -> Result<f64, Error<SPI::Error>> {
         if let Some(current_lsb) = self.current_lsb {
             self.current_raw().map(|x| (x as f64) * current_lsb)
         } else {
@@ -341,12 +339,12 @@ where
     }
 
     /// Get the raw value from the power register
-    pub fn power_raw(&mut self) -> Result<u32, Error<SPIError, CSError>> {
+    pub fn power_raw(&mut self) -> Result<u32, Error<SPI::Error>> {
         self.read_register_u24(Register::Power)
     }
 
     /// Get the power reading in Watts.
-    pub fn power_watts(&mut self) -> Result<f64, Error<SPIError, CSError>> {
+    pub fn power_watts(&mut self) -> Result<f64, Error<SPI::Error>> {
         if let Some(current_lsb) = self.current_lsb {
             self.power_raw()
                 .map(|x| (x as f64) * current_lsb * POWER_SCALING_FACTOR)
@@ -356,12 +354,12 @@ where
     }
 
     /// Get the unique manufacturer identification number.
-    pub fn manufacturer_id(&mut self) -> Result<u16, Error<SPIError, CSError>> {
+    pub fn manufacturer_id(&mut self) -> Result<u16, Error<SPI::Error>> {
         self.read_register_u16(Register::ManufacturerID)
     }
 
     /// Get the unique die identification number.
-    pub fn device_id(&mut self) -> Result<u16, Error<SPIError, CSError>> {
+    pub fn device_id(&mut self) -> Result<u16, Error<SPI::Error>> {
         self.read_register_u16(Register::DeviceID)
     }
 }
