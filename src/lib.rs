@@ -76,6 +76,44 @@ bitflags! {
         /// Reserved. Always reads 0.
         const RESERVED  = 0b0000_0000_0000_1111;
     }
+
+    /// Diagnostic Flags and Alert register contents.
+    #[repr(C)]
+    pub struct DiagAlrt: u16 {
+        /// Alert Latch Enable.
+        const ALATCH = 0b1000_0000_0000_0000;
+        /// Conversion Ready Flag Enable.
+        const CNVR = 0b0100_0000_0000_0000;
+        /// Slow Alert Enable.
+        const SLOWALERT = 0b0010_0000_0000_0000;
+        /// Alert Polarity.
+        const APOL = 0b0001_0000_0000_0000;
+        /// Energy Overflow.
+        const ENERGYOF = 0b0000_1000_0000_0000;
+        /// Charge Overflow.
+        const CHARGEOF = 0b0000_0100_0000_0000;
+        /// Math Overflow.
+        const MATHOF = 0b0000_0010_0000_0000;
+        /// Reserved. Always Zero.
+        const RESERVED = 0b0000_0001_0000_0000;
+        /// Temperature Over-limit.
+        const TMPOL = 0b0000_0000_1000_0000;
+        /// Shunt Over-limit.
+        const SHNTOL = 0b0000_0000_0100_0000;
+        /// Shunt Under-limit.
+        const SHNTUL = 0b0000_0000_0010_0000;
+        /// Bus Voltage Over-limit.
+        const BUSOL = 0b0000_0000_0001_0000;
+        /// Bus Voltage Under-limit.
+        const BUSUL = 0b0000_0000_0000_1000;
+        /// Power Over-limit.
+        const POL = 0b0000_0000_0000_0100;
+        /// Conversion Complete.
+        const CNVRF = 0b0000_0000_0000_0010;
+        /// Memory Status.
+        const MEMSTAT = 0b0000_0000_0000_0001;
+    }
+
 }
 
 /// The SPI mode for the INA229.
@@ -84,14 +122,49 @@ pub const MODE: Mode = MODE_1;
 #[repr(u8)]
 enum Register {
     Configuration = 0x00,
+    AdcConfiguration = 0x01,
     ShuntCalibration = 0x02,
     ShuntVoltage = 0x04,
     BusVoltage = 0x05,
     DieTemperature = 0x06,
     Current = 0x07,
     Power = 0x08,
+    DiagnosticAlert = 0x0B,
     ManufacturerID = 0x3E,
     DeviceID = 0x3F,
+}
+
+#[derive(Debug, Default)]
+pub enum AdcMode {
+    ContinuousBusShunt = 0xB,
+    #[default]
+    ContinuousBusShuntTemp = 0xF,
+}
+
+#[derive(Debug, Default)]
+pub enum ConversionTime {
+    Us50 = 0x0,
+    Us84 = 0x1,
+    Us150 = 0x2,
+    Us280 = 0x3,
+    Us540 = 0x4,
+    #[default]
+    Us1052 = 0x5,
+    Us2074 = 0x6,
+    Us4120 = 0x7,
+}
+
+#[derive(Debug, Default)]
+pub enum AdcAverage {
+    #[default]
+    A1 = 0x0,
+    A4 = 0x1,
+    A16 = 0x2,
+    A64 = 0x3,
+    A128 = 0x4,
+    A256 = 0x5,
+    A512 = 0x6,
+    A1024 = 0x7,
 }
 
 enum Command {
@@ -173,12 +246,10 @@ where
     }
 
     fn read_register_u16(&mut self, register: Register) -> Result<u16, Error<SPI::Error>> {
-        let mut buffer = [0x00, 0x00];
-        self.spi.transaction(&mut [
-            Operation::Write(&[get_frame(register, Command::Read)]),
-            Operation::Read(&mut buffer),
-        ])?;
-        let value = u16::from_be_bytes(buffer);
+        let mut buffer = [get_frame(register, Command::Read), 0x00, 0x00];
+        self.spi
+            .transaction(&mut [Operation::TransferInPlace(&mut buffer)])?;
+        let value = BigEndian::read_u16(&buffer[1..]);
         Ok(value)
     }
 
@@ -281,6 +352,31 @@ where
             .and_then(|_| self.calibrate(shunt_resistance, current_expected_max))
     }
 
+    pub fn set_diagnostic_alert_flags(&mut self, flags: DiagAlrt) -> Result<(), Error<SPI::Error>> {
+        self.write_register_u16(Register::DiagnosticAlert, flags.bits())
+    }
+
+    pub fn get_diagnostic_alert_flags(&mut self) -> Result<DiagAlrt, Error<SPI::Error>> {
+        self.read_register_u16(Register::DiagnosticAlert)
+            .map(DiagAlrt::from_bits_truncate)
+    }
+
+    pub fn set_adc_configuration(
+        &mut self,
+        mode: AdcMode,
+        vbusct: ConversionTime,
+        vshct: ConversionTime,
+        vtct: ConversionTime,
+        average: AdcAverage,
+    ) -> Result<(), Error<SPI::Error>> {
+        let value = (mode as u16) << 12
+            | (vbusct as u16) << 9
+            | (vshct as u16) << 6
+            | (vtct as u16) << 3
+            | (average as u16);
+        self.write_register_u16(Register::AdcConfiguration, value)
+    }
+
     /// Get the raw bus voltage reading.
     pub fn bus_voltage_raw(&mut self) -> Result<i32, Error<SPI::Error>> {
         self.read_register_i24(Register::BusVoltage).map(|x| x >> 4) // 20bit value.
@@ -362,9 +458,61 @@ where
     pub fn device_id(&mut self) -> Result<u16, Error<SPI::Error>> {
         self.read_register_u16(Register::DeviceID)
     }
+
+    /// Read the bus and current.
+    pub fn read_vbus_current(&mut self) -> Result<(i32, i32), Error<SPI::Error>> {
+        // let voltage = self.bus_voltage_raw()?;
+        // let current = self.current_raw()?;
+        let voltage = {
+            const CMD: u8 = get_frame(Register::BusVoltage, Command::Read);
+            let mut buffer = [
+                CMD, // Command.
+                0x00, 0x00, 0x00, // Bus Voltage.
+            ];
+            self.spi
+                .transaction(&mut [Operation::TransferInPlace(&mut buffer)])?;
+
+            BigEndian::read_i24(&buffer[1..]) >> 4
+        };
+        let current = {
+            const CMD: u8 = get_frame(Register::Current, Command::Read);
+            let mut buffer = [
+                CMD, // Command.
+                0x00, 0x00, 0x00, // Current.
+            ];
+            self.spi
+                .transaction(&mut [Operation::TransferInPlace(&mut buffer)])?;
+            BigEndian::read_i24(&buffer[1..]) >> 4
+        };
+
+        Ok((voltage, current))
+    }
+    /// Read the bus, die temperature, and current.
+    pub fn read_vbus_temp_current(&mut self) -> Result<(i32, i16, i32), Error<SPI::Error>> {
+        const CMD: u8 = get_frame(Register::BusVoltage, Command::Read);
+        let mut buffer = [
+            CMD, // Command.
+            0x00, 0x00, 0x00, // Bus Voltage.
+            0x00, 0x00, // Die Temp.
+            0x00, 0x00, 0x00, // Current.
+        ];
+        // self.spi.transaction(&mut [
+        //     Operation::Write(&[get_frame(Register::BusVoltage, Command::Read)]),
+        //     Operation::Read(&mut buffer),
+        // ])?;
+        self.spi
+            .transaction(&mut [Operation::TransferInPlace(&mut buffer)])?;
+        // let value = u16::from_be_bytes(buffer);
+        let vbus_raw = BigEndian::read_i24(&buffer[..3]) >> 4;
+        let dietemp_raw = BigEndian::read_i16(&buffer[3..5]);
+        let current_raw = BigEndian::read_i24(&buffer[5..]) >> 4;
+
+        Ok((vbus_raw, dietemp_raw, current_raw))
+    }
 }
 
-fn get_frame(register: Register, command: Command) -> u8 {
+#[inline]
+const fn get_frame(register: Register, command: Command) -> u8 {
     let frame = (register as u8) << 2u8;
     match command {
         Command::Write => frame & !0b00000001,
